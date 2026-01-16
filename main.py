@@ -8,6 +8,21 @@ import itertools
 from ascii_magic import AsciiArt
 from PIL import Image, ImageEnhance
 
+import ctypes
+
+def enable_dark_titlebar(window):
+    try:
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20  # Windows 11
+        value = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(value),
+            ctypes.sizeof(value)
+        )
+    except Exception:
+        pass
 
 # ---------- Appearance ----------
 ctk.set_appearance_mode("dark")
@@ -18,12 +33,10 @@ class App(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
 
-        self.overrideredirect(True)
+        self.title("ASCII Art Generator")
         self.geometry("720x820")
         self.configure(bg="#121212")
-
-        self._drag_x = 0
-        self._drag_y = 0
+        self.after(10, lambda: enable_dark_titlebar(self))
 
         # ---------- Variables ----------
         self.input_image = ctk.StringVar()
@@ -42,29 +55,7 @@ class App(TkinterDnD.Tk):
             ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
         )
 
-        self.build_titlebar()
         self.build_ui()
-
-    # ---------- Titlebar ----------
-    def build_titlebar(self):
-        bar = ctk.CTkFrame(self, height=36, fg_color="#1b1b1b", corner_radius=0)
-        bar.pack(fill="x")
-
-        bar.bind("<ButtonPress-1>", self.start_move)
-        bar.bind("<B1-Motion>", self.do_move)
-
-        ctk.CTkLabel(bar, text="ASCII Art Generator",
-                     font=("Segoe UI", 14, "bold")).pack(side="left", padx=12)
-
-        btns = ctk.CTkFrame(bar, fg_color="transparent")
-        btns.pack(side="right", padx=6)
-
-        ctk.CTkButton(btns, text="–", width=32, height=24,
-                      command=self.iconify).pack(side="left", padx=4)
-
-        ctk.CTkButton(btns, text="✕", width=32, height=24,
-                      fg_color="#8b0000", hover_color="#a00000",
-                      command=self.destroy).pack(side="left", padx=4)
 
     def start_move(self, e):
         self._drag_x = e.x
@@ -76,7 +67,7 @@ class App(TkinterDnD.Tk):
     # ---------- UI ----------
     def build_ui(self):
         main = ctk.CTkFrame(self, corner_radius=20)
-        main.pack(padx=25, pady=25, fill="both", expand=True)
+        main.pack(padx=25, pady=(35, 25), fill="both", expand=True)
 
         ctk.CTkLabel(main, text="ASCII Art Generator",
                      font=("Segoe UI", 26, "bold")).pack(pady=(10, 25))
@@ -258,59 +249,92 @@ class App(TkinterDnD.Tk):
 
     # ---------- CORE ----------
     def run(self):
-        if not self.input_image.get() or not self.output_path.get():
+        input_img = self.input_image.get()
+        output = self.output_path.get()
+
+        if not input_img or not output:
             messagebox.showwarning("Fehler", "Input oder Output fehlt.")
+            return
+
+        # ❗ ALLE Werte HIER holen (Main Thread!)
+        try:
+            params = {
+                "rotate": int(self.rotation.get()),
+                "columns": int(self.columns.get()),
+                "brightness": float(str(self.brightness.get()).replace(",", ".")),
+                "quality": int(self.jpg_quality.get()),
+                "color_mode": self.color_mode.get()
+            }
+        except ValueError:
+            messagebox.showerror("Fehler", "Ungültige Eingabewerte.")
             return
 
         self.generate_btn.configure(state="disabled", text="In Arbeit...")
         self.spinner_running = True
         self.after(0, self.animate_spinner)
 
-        threading.Thread(
+        thread = threading.Thread(
             target=self.generate_ascii,
-            args=(self.input_image.get(), self.output_path.get()),
+            args=(input_img, output, params),
             daemon=True
-        ).start()
+        )
+        thread.start()
 
-    def generate_ascii(self, input_img, output):
+
+    def generate_ascii(self, input_img, output, params):
+        rotate = params["rotate"]
+        columns = params["columns"]
+        brightness = params["brightness"]
+        quality = params["quality"]
+        mode = params["color_mode"]
+
+        if mode == "Schwarz & Weiß":
+            full_color = False
+            monochrome = True
+        elif mode == "8 Farben":
+            full_color = False
+            monochrome = False
+        else:
+            full_color = True
+            monochrome = False
+
+        output_dir = os.path.dirname(output) or "."
+        temp_out = os.path.join(output_dir, "temp.jpg")
+
         try:
-            brightness = float(self.brightness.get().replace(",", ".").strip())
-        except ValueError:
-            brightness = 1.0
-
-        rotate = int(self.rotation.get())
-        columns = int(self.columns.get())
-        quality = int(self.jpg_quality.get())
-
-        mode = self.color_mode.get()
-        full_color = mode == "Full Color"
-        monochrome = mode == "Schwarz & Weiß"
-
-        temp_out = os.path.join(os.path.dirname(output) or ".", "temp.png")
-
-        try:
-            art = AsciiArt.from_image(input_img)
+            my_art = AsciiArt.from_image(input_img)
 
             if brightness != 1:
-                art.image = ImageEnhance.Brightness(art.image).enhance(brightness)
-            if rotate != 0:
-                art.image = art.image.rotate(rotate, expand=True)
+                my_art.image = ImageEnhance.Brightness(
+                    my_art.image
+                ).enhance(brightness)
 
-            art.to_image_file(
+            if rotate != 0:
+                my_art.image = my_art.image.rotate(
+                    rotate, expand=True
+                )
+
+            my_art.to_image_file(
                 temp_out,
                 columns=columns,
                 full_color=full_color,
                 monochrome=monochrome
             )
 
-            Image.open(temp_out).save(
-                output, quality=quality, optimize=True, subsampling=0
+            img = Image.open(temp_out)
+            img.save(
+                output,
+                quality=quality,
+                optimize=True,
+                subsampling=0
             )
 
         finally:
             if os.path.exists(temp_out):
                 os.remove(temp_out)
-            self.after(0, self.finish_generation)
+
+        self.after(0, self.finish_generation)
+
 
     def finish_generation(self):
         self.spinner_running = False
