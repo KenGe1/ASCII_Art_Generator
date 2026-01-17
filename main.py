@@ -4,11 +4,9 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
 import threading
 import itertools
-
+import ctypes
 from ascii_magic import AsciiArt
 from PIL import Image, ImageEnhance
-
-import ctypes
 
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
@@ -176,7 +174,7 @@ class App(TkinterDnD.Tk):
         ctk.CTkButton(path, text="📁", width=54, height=44,
                       command=self.select_output).pack(side="left", padx=(10, 0))
 
-                # --- Settings (2x2 Grid) ---
+        # --- Settings (2x2 Grid) ---
         settings = ctk.CTkFrame(main, fg_color="transparent")
         settings.pack(pady=(0, 35))
 
@@ -255,7 +253,7 @@ class App(TkinterDnD.Tk):
             fg_color="transparent"
         )
 
-        # absolut unten rechts im Fenster
+        # unten rechts im Fenster
         self.adv_overlay.place(
             relx=1.0,
             rely=1.0,
@@ -352,7 +350,6 @@ class App(TkinterDnD.Tk):
             messagebox.showwarning("Fehler", "Input oder Output fehlt.")
             return
 
-        # ❗ ALLE Werte HIER holen (Main Thread!)
         try:
             params = {
                 "rotate": int(self.rotation.get()),
