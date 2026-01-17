@@ -10,17 +10,94 @@ from PIL import Image, ImageEnhance
 
 import ctypes
 
+Image.MAX_IMAGE_PIXELS = 400_000_000
+
+class ToolTip(ctk.CTkToplevel):
+    def __init__(self, widget, text):
+        super().__init__(widget)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+
+        label = ctk.CTkLabel(
+            self,
+            text=text,
+            font=("Segoe UI", 12),
+            corner_radius=8,
+            fg_color=("gray85", "gray20"),
+            text_color=("black", "white"),
+            padx=10,
+            pady=6,
+            justify="left",
+            wraplength=260
+        )
+        label.pack()
+
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, event):
+        x = event.widget.winfo_rootx() + 20
+        y = event.widget.winfo_rooty() + 20
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+
+    def hide(self, event):
+        self.withdraw()
+
+
+def labeled_with_info(parent, text, info):
+    frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+    lbl = ctk.CTkLabel(
+        frame,
+        text=text,
+        font=("Segoe UI", 14)
+    )
+    lbl.pack(side="left")
+
+    info_icon = ctk.CTkLabel(
+        frame,
+        text="ⓘ",
+        font=("Segoe UI", 14, "bold"),
+        text_color=("gray40", "gray70"),
+        cursor="hand2"
+    )
+    info_icon.pack(side="left", padx=(6, 0))
+
+    ToolTip(info_icon, info)
+
+    return frame
+
+
 def enable_dark_titlebar(window):
     try:
         hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20  # Windows 11
+
         value = ctypes.c_int(1)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+
+        # Windows 11
+        DWMWA_USE_IMMERSIVE_DARK_MODE_WIN11 = 20
+        # Windows 10
+        DWMWA_USE_IMMERSIVE_DARK_MODE_WIN10 = 19
+
+        # Erst Windows 11 versuchen
+        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
             hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_USE_IMMERSIVE_DARK_MODE_WIN11,
             ctypes.byref(value),
             ctypes.sizeof(value)
         )
+
+        # Falls das fehlschlägt → Windows 10
+        if result != 0:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE_WIN10,
+                ctypes.byref(value),
+                ctypes.sizeof(value)
+            )
+
     except Exception:
         pass
 
@@ -107,25 +184,37 @@ class App(TkinterDnD.Tk):
         settings.grid_columnconfigure((0, 1), weight=1)
 
         # Labels
-        ctk.CTkLabel(
-            settings, text="Columns",
-            font=("Segoe UI", 14)
-        ).grid(row=0, column=0, padx=25, pady=(0, 6))
+        labeled_with_info(
+            settings,
+            "Columns",
+            "Anzahl der Zeichen pro Zeile.\n"
+            "Höher = mehr Details, aber größere Datei."
+        ).grid(row=0, column=0, pady=(0, 6))
 
-        ctk.CTkLabel(
-            settings, text="Rotation",
-            font=("Segoe UI", 14)
-        ).grid(row=0, column=1, padx=25, pady=(0, 6))
+        labeled_with_info(
+            settings,
+            "Rotation",
+            "Dreht das Bild vor der ASCII-Umwandlung nach links.\n"
+            "Nützlich für Hochformat-Bilder."
+        ).grid(row=0, column=1, pady=(0, 6))
 
-        ctk.CTkLabel(
-            settings, text="Helligkeit",
-            font=("Segoe UI", 14)
-        ).grid(row=2, column=0, padx=25, pady=(16, 6))
+        labeled_with_info(
+            settings,
+            "Helligkeit",
+            "Passt die Bildhelligkeit an.\n"
+            "1.0 = unverändert\n"
+            "< 1 = dunkler\n"
+            "> 1 = heller"
+        ).grid(row=2, column=0, pady=(16, 6))
 
-        ctk.CTkLabel(
-            settings, text="Farbe",
-            font=("Segoe UI", 14)
-        ).grid(row=2, column=1, padx=25, pady=(16, 6))
+        labeled_with_info(
+            settings,
+            "Farbe",
+            "Schwarz & Weiß: reines ASCII\n"
+            "8 Farben: begrenzte Farbpalette\n"
+            "Full Color: maximale Farbtiefe"
+        ).grid(row=2, column=1, pady=(16, 6))
+
 
         # Eingabefelder
         ctk.CTkEntry(
@@ -237,10 +326,17 @@ class App(TkinterDnD.Tk):
     def select_output(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".jpg",
-            filetypes=[("JPEG", "*.jpg")]
+            filetypes=[
+                ("JPEG", "*.jpg"),
+                ("PNG", "*.png"),
+                ("GIF", "*.gif"),
+                ("TIFF", "*.tiff"),
+                ("BMP", "*.bmp")
+            ]
         )
         if path:
             self.output_path.set(path)
+
 
     def animate_spinner(self):
         if self.spinner_running:
