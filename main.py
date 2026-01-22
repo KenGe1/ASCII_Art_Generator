@@ -2,11 +2,13 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
-from multiprocessing import Process, Queue
+import multiprocessing
+from multiprocessing import Process, Queue, freeze_support
 import itertools
 import ctypes
 from ascii_magic import AsciiArt
 from PIL import Image, ImageEnhance
+import sys
 
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
@@ -430,7 +432,6 @@ class App(TkinterDnD.Tk):
         self.process = Process(
             target=generate_ascii_worker,
             args=(input_img, output, params, self.result_queue),
-            daemon=True
         )
         self.process.start()
 
@@ -438,26 +439,27 @@ class App(TkinterDnD.Tk):
         self.after(0, self.check_process_status)
 
     def check_process_status(self):
-        if not self.process or self.process.exitcode is not None:
-            # Prozess ist beendet, zurücksetzen der GUI
+        # 1️⃣ ZUERST versuchen, ein Ergebnis aus der Queue zu holen
+        try:
+            result = self.result_queue.get_nowait()
+        except Exception:
+            result = None
+
+        if result is not None:
+            if isinstance(result, Exception):
+                messagebox.showerror("Fehler", str(result))
+            # Erfolg ODER Fehler → Generation beenden
             self.finish_generation()
             return
 
-        try:
-            result = self.result_queue.get_nowait()
-            if isinstance(result, Exception):
-                # Fehlerbehandlung
-                messagebox.showerror("Fehler", str(result))
-                self.finish_generation()
-            else:
-                # Erfolgreiche Beendigung
-                self.finish_generation()
-        except:
-            pass
+        # 2️⃣ DANACH prüfen, ob der Prozess beendet ist
+        if self.process and self.process.exitcode is not None:
+            self.finish_generation()
+            return
 
-        # Nur weiter überprüfen, wenn der Prozess noch läuft und kein Ergebnis vorliegt
-        if self.process and self.process.exitcode is None:
-            self.after(100, self.check_process_status)
+        # 3️⃣ Weiter pollen
+        self.after(100, self.check_process_status)
+
 
     def finish_generation(self):
         self.spinner_running = False
@@ -465,10 +467,17 @@ class App(TkinterDnD.Tk):
         # Der Text wird in animate_spinner zurückgesetzt
 
 # ---------- Start ----------
-if __name__ == "__main__":
-    # Setzen des Startmethoden für multiprocessing (wichtig für Windows)
-    if not os.environ.get('MPLCONFIGPROFILE', None):
-        os.environ['MPLCONFIGPROFILE'] = 'spawn'
-
+def main():
+    # 🔥 Arbeitsverzeichnis korrekt setzen
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(base_dir)
     app = App()
     app.mainloop()
+    
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    multiprocessing.set_start_method("spawn", force=True)
+    main()
