@@ -34,7 +34,7 @@ Das Tool konvertiert Bilder in farbiges oder monochromes ASCII-Art und bietet za
 ### Abhängigkeiten installieren
 
 ```bash
-pip install ascii-magic customtkinter pillow tkinterdnd2
+pip install ascii-magic, customtkinter, pillow, tkinterdnd2
 ```
 
 ---
