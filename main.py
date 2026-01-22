@@ -2,11 +2,13 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
-import threading
+import multiprocessing
+from multiprocessing import Process, Queue, freeze_support
 import itertools
 import ctypes
 from ascii_magic import AsciiArt
 from PIL import Image, ImageEnhance
+import sys
 
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
@@ -43,7 +45,6 @@ class ToolTip(ctk.CTkToplevel):
     def hide(self, event):
         self.withdraw()
 
-
 def labeled_with_info(parent, text, info):
     frame = ctk.CTkFrame(parent, fg_color="transparent")
 
@@ -66,7 +67,6 @@ def labeled_with_info(parent, text, info):
     ToolTip(info_icon, info)
 
     return frame
-
 
 def enable_dark_titlebar(window):
     try:
@@ -103,11 +103,66 @@ def enable_dark_titlebar(window):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
+def generate_ascii_worker(input_img, output, params, queue):
+    rotate = params["rotate"]
+    columns = params["columns"]
+    brightness = params["brightness"]
+    quality = params["quality"]
+    mode = params["color_mode"]
+
+    if mode == "Schwarz & Weiß":
+        full_color = False
+        monochrome = True
+    elif mode == "8 Farben":
+        full_color = False
+        monochrome = False
+    else:
+        full_color = True
+        monochrome = False
+
+    output_dir = os.path.dirname(output) or "."
+    temp_out = os.path.join(output_dir, "temp.jpg")
+
+    try:
+        my_art = AsciiArt.from_image(input_img)
+
+        if brightness != 1:
+            my_art.image = ImageEnhance.Brightness(
+                my_art.image
+            ).enhance(brightness)
+
+        if rotate != 0:
+            my_art.image = my_art.image.rotate(
+                rotate, expand=True
+            )
+
+        my_art.to_image_file(
+            temp_out,
+            columns=columns,
+            full_color=full_color,
+            monochrome=monochrome
+        )
+
+        img = Image.open(temp_out)
+        img.save(
+            output,
+            quality=quality,
+            optimize=True,
+            subsampling=0
+        )
+    except Exception as e:
+        queue.put(e)  # Fehler in die Queue schreiben
+        return
+    finally:
+        if os.path.exists(temp_out):
+            os.remove(temp_out)
+
+    # Erfolg in die Queue schreiben
+    queue.put(True)
 
 class App(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-
         self.title("ASCII Art Generator")
         self.geometry("720x820")
         self.configure(bg="#121212")
@@ -129,6 +184,9 @@ class App(TkinterDnD.Tk):
         self.spinner_cycle = itertools.cycle(
             ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
         )
+
+        self.process = None  # Für den Multiprocessing-Prozess
+        self.result_queue = Queue()  # Queue für die Kommunikation zwischen Prozessen
 
         self.build_ui()
 
@@ -213,7 +271,6 @@ class App(TkinterDnD.Tk):
             "Full Color: maximale Farbtiefe"
         ).grid(row=2, column=1, pady=(16, 6))
 
-
         # Eingabefelder
         ctk.CTkEntry(
             settings,
@@ -295,7 +352,6 @@ class App(TkinterDnD.Tk):
                 else self.adv_frame.grid_forget()
         ).grid(row=0, column=1, rowspan=2)
 
-
         # --- Generate ---
         gen = ctk.CTkFrame(main, fg_color="transparent")
         gen.pack(fill="x", padx=25, pady=25)
@@ -335,11 +391,13 @@ class App(TkinterDnD.Tk):
         if path:
             self.output_path.set(path)
 
-
     def animate_spinner(self):
         if self.spinner_running:
             self.loading_label.configure(text=next(self.spinner_cycle))
             self.after(100, self.animate_spinner)
+        else:
+            # Falls der Spinner nicht mehr läuft, den Text zurücksetzen
+            self.loading_label.configure(text="")
 
     # ---------- CORE ----------
     def run(self):
@@ -362,79 +420,64 @@ class App(TkinterDnD.Tk):
             messagebox.showerror("Fehler", "Ungültige Eingabewerte.")
             return
 
+        # GUI aktualisieren
         self.generate_btn.configure(state="disabled", text="In Arbeit...")
         self.spinner_running = True
         self.after(0, self.animate_spinner)
 
-        thread = threading.Thread(
-            target=self.generate_ascii,
-            args=(input_img, output, params),
-            daemon=True
+        # Neues Queue-Objekt für jeden Generierungsvorgang erstellen
+        self.result_queue = Queue()
+
+        # Prozess starten
+        self.process = Process(
+            target=generate_ascii_worker,
+            args=(input_img, output, params, self.result_queue),
         )
-        thread.start()
+        self.process.start()
 
+        # Asynchron auf das Ergebnis warten (ohne zu blockieren)
+        self.after(0, self.check_process_status)
 
-    def generate_ascii(self, input_img, output, params):
-        rotate = params["rotate"]
-        columns = params["columns"]
-        brightness = params["brightness"]
-        quality = params["quality"]
-        mode = params["color_mode"]
-
-        if mode == "Schwarz & Weiß":
-            full_color = False
-            monochrome = True
-        elif mode == "8 Farben":
-            full_color = False
-            monochrome = False
-        else:
-            full_color = True
-            monochrome = False
-
-        output_dir = os.path.dirname(output) or "."
-        temp_out = os.path.join(output_dir, "temp.jpg")
-
+    def check_process_status(self):
+        # 1️⃣ ZUERST versuchen, ein Ergebnis aus der Queue zu holen
         try:
-            my_art = AsciiArt.from_image(input_img)
+            result = self.result_queue.get_nowait()
+        except Exception:
+            result = None
 
-            if brightness != 1:
-                my_art.image = ImageEnhance.Brightness(
-                    my_art.image
-                ).enhance(brightness)
+        if result is not None:
+            if isinstance(result, Exception):
+                messagebox.showerror("Fehler", str(result))
+            # Erfolg ODER Fehler → Generation beenden
+            self.finish_generation()
+            return
 
-            if rotate != 0:
-                my_art.image = my_art.image.rotate(
-                    rotate, expand=True
-                )
+        # 2️⃣ DANACH prüfen, ob der Prozess beendet ist
+        if self.process and self.process.exitcode is not None:
+            self.finish_generation()
+            return
 
-            my_art.to_image_file(
-                temp_out,
-                columns=columns,
-                full_color=full_color,
-                monochrome=monochrome
-            )
-
-            img = Image.open(temp_out)
-            img.save(
-                output,
-                quality=quality,
-                optimize=True,
-                subsampling=0
-            )
-
-        finally:
-            if os.path.exists(temp_out):
-                os.remove(temp_out)
-
-        self.after(0, self.finish_generation)
+        # 3️⃣ Weiter pollen
+        self.after(100, self.check_process_status)
 
 
     def finish_generation(self):
         self.spinner_running = False
         self.generate_btn.configure(state="normal", text="🚀 Generieren")
-        self.loading_label.configure(text="")
-
+        # Der Text wird in animate_spinner zurückgesetzt
 
 # ---------- Start ----------
+def main():
+    # 🔥 Arbeitsverzeichnis korrekt setzen
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(base_dir)
+    app = App()
+    app.mainloop()
+    
 if __name__ == "__main__":
-    App().mainloop()
+    multiprocessing.freeze_support()
+    multiprocessing.set_start_method("spawn", force=True)
+    main()
