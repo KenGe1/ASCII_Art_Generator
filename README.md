@@ -1,4 +1,4 @@
-**English version available here: [README_EN.md](README_EN.md).
+English version available here: [README_EN.md](README_EN.md).
 ---
 # ASCII Art Generator (GUI)
 
