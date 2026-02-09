@@ -106,6 +106,7 @@ Besonders gern gesehen:
 - UI-Verbesserungen
 - Performance-Optimierungen
 - Linux / macOS Support
+- Verarbeitung von GIF Animationen
 
 ---
 
