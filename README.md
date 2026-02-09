@@ -1,3 +1,5 @@
+English version available here: [README_EN.md](README_EN.md).
+---
 # ASCII Art Generator (GUI)
 
 Ein moderner **ASCII Art Generator mit grafischer Benutzeroberfläche**, geschrieben in Python.  
