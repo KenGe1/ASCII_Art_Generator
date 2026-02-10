@@ -18,6 +18,7 @@ The tool converts images into color or monochrome ASCII art and offers numerous 
 - 🧵 **Multiprocessing** (GUI remains responsive)
 - 📂 **Drag & Drop** for images
 - 💾 Export as JPG, PNG, GIF, TIFF, BMP
+- 🎞️ Animated GIFs are processed frame-by-frame and exported as animated GIFs
 - 🪟 Modern dark-mode GUI with `customtkinter`
 - 🔄 Loading spinner & status feedback
 - 🧩 Advanced settings (JPEG quality)
@@ -106,7 +107,6 @@ Especially appreciated:
 - UI improvements
 - Performance optimizations
 - Linux / macOS support
-- Processing GIF animations
 
 ---
 
