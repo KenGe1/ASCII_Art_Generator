@@ -7,8 +7,9 @@ from multiprocessing import Process, Queue, freeze_support
 import itertools
 import ctypes
 from ascii_magic import AsciiArt
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageSequence
 import sys
+import tempfile
 
 Image.MAX_IMAGE_PIXELS = 400_000_000
 
@@ -121,10 +122,14 @@ def generate_ascii_worker(input_img, output, params, queue):
         monochrome = False
 
     output_dir = os.path.dirname(output) or "."
-    temp_out = os.path.join(output_dir, "temp.jpg")
 
-    try:
-        my_art = AsciiArt.from_image(input_img)
+    def render_ascii_image(source_path):
+        with tempfile.NamedTemporaryFile(
+            suffix=".png", dir=output_dir, delete=False
+        ) as temp_out_file:
+            temp_out = temp_out_file.name
+
+        my_art = AsciiArt.from_image(source_path)
 
         if brightness != 1:
             my_art.image = ImageEnhance.Brightness(
@@ -143,19 +148,62 @@ def generate_ascii_worker(input_img, output, params, queue):
             monochrome=monochrome
         )
 
-        img = Image.open(temp_out)
-        img.save(
-            output,
-            quality=quality,
-            optimize=True,
-            subsampling=0
-        )
+        ascii_image = Image.open(temp_out).convert("RGBA")
+        os.remove(temp_out)
+        return ascii_image
+
+    try:
+        with Image.open(input_img) as source_image:
+            is_animated_gif = (
+                source_image.format == "GIF"
+                and getattr(source_image, "is_animated", False)
+                and source_image.n_frames > 1
+            )
+
+            if is_animated_gif:
+                frames = []
+                durations = []
+                loop = source_image.info.get("loop", 0)
+
+                for frame in ImageSequence.Iterator(source_image):
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".png", dir=output_dir, delete=False
+                    ) as temp_frame_file:
+                        temp_frame_path = temp_frame_file.name
+
+                    frame.convert("RGBA").save(temp_frame_path, format="PNG")
+                    ascii_frame = render_ascii_image(temp_frame_path)
+                    os.remove(temp_frame_path)
+
+                    frames.append(ascii_frame.convert("P", palette=Image.ADAPTIVE))
+                    durations.append(frame.info.get("duration", 100))
+
+                if not frames:
+                    raise ValueError("Das GIF enthält keine Frames.")
+
+                frames[0].save(
+                    output,
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=durations,
+                    loop=loop,
+                    optimize=False,
+                    disposal=2,
+                )
+            else:
+                img = render_ascii_image(input_img)
+                save_params = {
+                    "optimize": True,
+                }
+
+                if output.lower().endswith((".jpg", ".jpeg")):
+                    save_params.update({"quality": quality, "subsampling": 0})
+                    img = img.convert("RGB")
+
+                img.save(output, **save_params)
     except Exception as e:
         queue.put(e)  # Fehler in die Queue schreiben
         return
-    finally:
-        if os.path.exists(temp_out):
-            os.remove(temp_out)
 
     # Erfolg in die Queue schreiben
     queue.put(True)
@@ -406,6 +454,23 @@ class App(TkinterDnD.Tk):
 
         if not input_img or not output:
             messagebox.showwarning("Fehler", "Input oder Output fehlt.")
+            return
+
+        try:
+            with Image.open(input_img) as source_image:
+                is_animated_gif = (
+                    source_image.format == "GIF"
+                    and getattr(source_image, "is_animated", False)
+                    and source_image.n_frames > 1
+                )
+        except Exception:
+            is_animated_gif = False
+
+        if is_animated_gif and not output.lower().endswith(".gif"):
+            messagebox.showwarning(
+                "Fehler",
+                "Animierte GIFs können nur als .gif ausgegeben werden."
+            )
             return
 
         try:
