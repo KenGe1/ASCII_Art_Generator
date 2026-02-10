@@ -198,6 +198,7 @@ def generate_ascii_worker(input_img, output, params, queue):
 
                 if output.lower().endswith((".jpg", ".jpeg")):
                     save_params.update({"quality": quality, "subsampling": 0})
+                    img = img.convert("RGB")
 
                 img.save(output, **save_params)
     except Exception as e:
