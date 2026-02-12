@@ -516,8 +516,8 @@ class App(TkinterDnD.Tk):
         self.brightness = ctk.StringVar(value="1.0")
         self.color_mode = ctk.StringVar(value="Full Color")
 
-        self.jpg_quality = ctk.IntVar(value=95)
-        self.frame_cores = ctk.IntVar(value=max(1, multiprocessing.cpu_count() // 2))
+        self.jpg_quality = ctk.StringVar(value="95")
+        self.frame_cores = ctk.StringVar(value=str(max(1, multiprocessing.cpu_count() // 2)))
         self.advanced = ctk.BooleanVar(value=False)
 
         self.spinner_running = False
@@ -790,17 +790,27 @@ class App(TkinterDnD.Tk):
             return
 
         try:
+            quality_text = str(self.jpg_quality.get()).strip()
+            cores_text = str(self.frame_cores.get()).strip()
+
+            quality = int(quality_text) if quality_text else 95
+            frame_cores = int(cores_text) if cores_text else max(1, multiprocessing.cpu_count() // 2)
+
             params = {
                 "rotate": int(self.rotation.get()),
                 "columns": int(self.columns.get()),
                 "brightness": float(str(self.brightness.get()).replace(",", ".")),
-                "quality": int(self.jpg_quality.get()),
+                "quality": max(1, min(100, quality)),
                 "color_mode": self.color_mode.get(),
-                "frame_cores": max(1, min(int(self.frame_cores.get()), multiprocessing.cpu_count()))
+                "frame_cores": max(1, min(frame_cores, multiprocessing.cpu_count()))
             }
         except ValueError:
             messagebox.showerror("Fehler", "Ungültige Eingabewerte.")
             return
+
+        # Eingabefelder bei Bedarf auf bereinigte Werte zurücksetzen
+        self.jpg_quality.set(str(params["quality"]))
+        self.frame_cores.set(str(params["frame_cores"]))
 
         # GUI aktualisieren
         self.generate_btn.configure(state="disabled", text="In Arbeit...")
