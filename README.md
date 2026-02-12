@@ -21,6 +21,7 @@ Das Tool konvertiert Bilder in farbiges oder monochromes ASCII-Art und bietet za
 - 📂 **Drag & Drop** für Bilder
 - 💾 Export als JPG, PNG, GIF, TIFF, BMP
 - 🎞️ Animierte GIFs werden Frame-für-Frame verarbeitet und wieder als GIF exportiert
+- 🎬 MP4-Videos werden in Frames zerlegt, in ASCII konvertiert und als MP4 mit Originalton exportiert
 - 🪟 Moderne Dark-Mode-GUI mit `customtkinter`
 - 🔄 Lade-Spinner & Statusfeedback
 - 🧩 Erweiterte Einstellungen (JPEG-Qualität)
@@ -33,6 +34,7 @@ Das Tool konvertiert Bilder in farbiges oder monochromes ASCII-Art und bietet za
 
 - **Python 3.10 oder neuer**
 - Windows 10 / 11
+- **FFmpeg** im PATH (für MP4-Verarbeitung)
 
 ### Abhängigkeiten installieren
 
