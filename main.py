@@ -4,6 +4,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
 import multiprocessing
 from multiprocessing import Process, Queue, freeze_support
+from queue import Empty
 import itertools
 import ctypes
 import shutil
@@ -234,6 +235,7 @@ def generate_ascii_worker(input_img, output, params, queue):
                 ascii_path = os.path.join(temp_dir, f"ascii_{index:08d}.png")
                 ascii_img = render_ascii_image(source_path)
                 ascii_img.save(ascii_path, optimize=True)
+                queue.put(("progress", index, len(source_frames)))
 
             run_command([
                 "ffmpeg",
@@ -278,8 +280,9 @@ def generate_ascii_worker(input_img, output, params, queue):
                 frames = []
                 durations = []
                 loop = source_image.info.get("loop", 0)
+                total_frames = source_image.n_frames
 
-                for frame in ImageSequence.Iterator(source_image):
+                for index, frame in enumerate(ImageSequence.Iterator(source_image), start=1):
                     with tempfile.NamedTemporaryFile(
                         suffix=".png", dir=output_dir, delete=False
                     ) as temp_frame_file:
@@ -291,6 +294,7 @@ def generate_ascii_worker(input_img, output, params, queue):
 
                     frames.append(ascii_frame.convert("P", palette=Image.ADAPTIVE))
                     durations.append(frame.info.get("duration", 100))
+                    queue.put(("progress", index, total_frames))
 
                 if not frames:
                     raise ValueError("Das GIF enthält keine Frames.")
@@ -629,16 +633,25 @@ class App(TkinterDnD.Tk):
         self.after(0, self.check_process_status)
 
     def check_process_status(self):
-        # 1️⃣ ZUERST versuchen, ein Ergebnis aus der Queue zu holen
-        try:
-            result = self.result_queue.get_nowait()
-        except Exception:
-            result = None
+        # 1️⃣ Alle verfügbaren Queue-Nachrichten verarbeiten
+        while True:
+            try:
+                result = self.result_queue.get_nowait()
+            except Empty:
+                break
 
-        if result is not None:
+            if isinstance(result, tuple) and len(result) == 3 and result[0] == "progress":
+                current = result[1]
+                total = result[2]
+                self.generate_btn.configure(text=f"In Arbeit... {current}/{total}")
+                continue
+
             if isinstance(result, Exception):
                 messagebox.showerror("Fehler", str(result))
-            # Erfolg ODER Fehler → Generation beenden
+                self.finish_generation()
+                return
+
+            # Erfolg ODER unbekannte End-Nachricht → Generation beenden
             self.finish_generation()
             return
 
