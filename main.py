@@ -419,6 +419,64 @@ def generate_ascii_worker(input_img, output, params, queue):
             else:
                 shutil.copyfile(temp_video, output_video)
 
+    def process_mp4_video(input_video, output_video):
+        fps = get_video_fps(input_video)
+
+        with tempfile.TemporaryDirectory(dir=output_dir) as temp_dir:
+            source_pattern = os.path.join(temp_dir, "source_%08d.png")
+            ascii_pattern = os.path.join(temp_dir, "ascii_%08d.png")
+            temp_video = os.path.join(temp_dir, "video_no_audio.mp4")
+
+            run_command([
+                "ffmpeg",
+                "-y",
+                "-i", input_video,
+                "-vsync", "0",
+                source_pattern,
+            ])
+
+            source_frames = sorted(
+                file_name
+                for file_name in os.listdir(temp_dir)
+                if file_name.startswith("source_") and file_name.endswith(".png")
+            )
+
+            if not source_frames:
+                raise RuntimeError("Das MP4 enthält keine verarbeitbaren Frames.")
+
+            for index, frame_name in enumerate(source_frames, start=1):
+                source_path = os.path.join(temp_dir, frame_name)
+                ascii_path = os.path.join(temp_dir, f"ascii_{index:08d}.png")
+                ascii_img = render_ascii_image(source_path)
+                ascii_img.save(ascii_path, optimize=True)
+                queue.put(("progress", index, len(source_frames)))
+
+            run_command([
+                "ffmpeg",
+                "-y",
+                "-framerate", f"{fps:.6f}",
+                "-i", ascii_pattern,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                temp_video,
+            ])
+
+            if has_audio_stream(input_video):
+                run_command([
+                    "ffmpeg",
+                    "-y",
+                    "-i", temp_video,
+                    "-i", input_video,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "copy",
+                    "-c:a", "copy",
+                    "-shortest",
+                    output_video,
+                ])
+            else:
+                shutil.copyfile(temp_video, output_video)
+
     try:
         if input_img.lower().endswith(".mp4"):
             process_mp4_video(input_img, output)
