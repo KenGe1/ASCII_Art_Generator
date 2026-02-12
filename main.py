@@ -4,8 +4,12 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
 import multiprocessing
 from multiprocessing import Process, Queue, freeze_support
+from queue import Empty
+from math import ceil
 import itertools
 import ctypes
+import shutil
+import subprocess
 from ascii_magic import AsciiArt
 from PIL import Image, ImageEnhance, ImageSequence
 import sys
@@ -104,12 +108,71 @@ def enable_dark_titlebar(window):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
+
+def render_ascii_file(source_path, output_path, render_params):
+    output_dir = os.path.dirname(output_path) or "."
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".png", dir=output_dir, delete=False
+    ) as temp_out_file:
+        temp_out = temp_out_file.name
+
+    my_art = AsciiArt.from_image(source_path)
+
+    if render_params["brightness"] != 1:
+        my_art.image = ImageEnhance.Brightness(
+            my_art.image
+        ).enhance(render_params["brightness"])
+
+    if render_params["rotate"] != 0:
+        my_art.image = my_art.image.rotate(
+            render_params["rotate"], expand=True
+        )
+
+    my_art.to_image_file(
+        temp_out,
+        columns=render_params["columns"],
+        full_color=render_params["full_color"],
+        monochrome=render_params["monochrome"]
+    )
+
+    with Image.open(temp_out) as rendered:
+        rendered.convert("RGBA").save(output_path, optimize=True)
+
+    os.remove(temp_out)
+
+
+def process_frame_batch(batch, render_params):
+    processed = 0
+    for source_path, output_path in batch:
+        render_ascii_file(source_path, output_path, render_params)
+        processed += 1
+    return processed
+
+
+def process_frame_batch_payload(payload):
+    batch, render_params = payload
+    return process_frame_batch(batch, render_params)
+
+
+def split_into_batches(items, batch_count):
+    if not items:
+        return []
+
+    chunk_size = ceil(len(items) / batch_count)
+    return [
+        items[index:index + chunk_size]
+        for index in range(0, len(items), chunk_size)
+    ]
+
+
 def generate_ascii_worker(input_img, output, params, queue):
     rotate = params["rotate"]
     columns = params["columns"]
     brightness = params["brightness"]
     quality = params["quality"]
     mode = params["color_mode"]
+    frame_cores = max(1, int(params.get("frame_cores", 1)))
 
     if mode == "Schwarz & Weiß":
         full_color = False
@@ -121,7 +184,65 @@ def generate_ascii_worker(input_img, output, params, queue):
         full_color = True
         monochrome = False
 
+    render_params = {
+        "rotate": rotate,
+        "columns": columns,
+        "brightness": brightness,
+        "full_color": full_color,
+        "monochrome": monochrome,
+    }
+
     output_dir = os.path.dirname(output) or "."
+
+    def run_command(command):
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                "FFmpeg wurde nicht gefunden. Bitte FFmpeg installieren und zum PATH hinzufügen."
+            ) from e
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            raise RuntimeError(stderr or "FFmpeg-Befehl fehlgeschlagen.") from e
+
+    def get_video_fps(video_path):
+        output_text = run_command([
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            video_path,
+        ]).strip()
+
+        if not output_text or output_text == "0/0":
+            return 30.0
+
+        if "/" in output_text:
+            num, den = output_text.split("/", 1)
+            den_value = float(den)
+            if den_value == 0:
+                return 30.0
+            return float(num) / den_value
+
+        return float(output_text)
+
+    def has_audio_stream(video_path):
+        output_text = run_command([
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            video_path,
+        ]).strip()
+        return bool(output_text)
 
     def render_ascii_image(source_path):
         with tempfile.NamedTemporaryFile(
@@ -129,30 +250,102 @@ def generate_ascii_worker(input_img, output, params, queue):
         ) as temp_out_file:
             temp_out = temp_out_file.name
 
-        my_art = AsciiArt.from_image(source_path)
+        render_ascii_file(source_path, temp_out, render_params)
 
-        if brightness != 1:
-            my_art.image = ImageEnhance.Brightness(
-                my_art.image
-            ).enhance(brightness)
+        with Image.open(temp_out) as rendered:
+            result_img = rendered.convert("RGBA")
+        os.remove(temp_out)
+        return result_img
 
-        if rotate != 0:
-            my_art.image = my_art.image.rotate(
-                rotate, expand=True
+    def process_frames_parallel(frame_pairs):
+        total_frames = len(frame_pairs)
+        if total_frames == 0:
+            return
+
+        workers = max(1, min(frame_cores, total_frames))
+
+        if workers == 1:
+            for index, (source_path, target_path) in enumerate(frame_pairs, start=1):
+                render_ascii_file(source_path, target_path, render_params)
+                queue.put(("progress", index, total_frames))
+            return
+
+        batches = split_into_batches(frame_pairs, workers)
+        processed_frames = 0
+
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=workers) as pool:
+            payloads = [(batch, render_params) for batch in batches]
+            for processed_batch in pool.imap_unordered(process_frame_batch_payload, payloads):
+                processed_frames += processed_batch
+                queue.put(("progress", processed_frames, total_frames))
+
+    def process_mp4_video(input_video, output_video):
+        fps = get_video_fps(input_video)
+
+        with tempfile.TemporaryDirectory(dir=output_dir) as temp_dir:
+            source_pattern = os.path.join(temp_dir, "source_%08d.png")
+            ascii_pattern = os.path.join(temp_dir, "ascii_%08d.png")
+            temp_video = os.path.join(temp_dir, "video_no_audio.mp4")
+
+            run_command([
+                "ffmpeg",
+                "-y",
+                "-i", input_video,
+                "-vsync", "0",
+                source_pattern,
+            ])
+
+            source_frames = sorted(
+                file_name
+                for file_name in os.listdir(temp_dir)
+                if file_name.startswith("source_") and file_name.endswith(".png")
             )
 
-        my_art.to_image_file(
-            temp_out,
-            columns=columns,
-            full_color=full_color,
-            monochrome=monochrome
-        )
+            if not source_frames:
+                raise RuntimeError("Das MP4 enthält keine verarbeitbaren Frames.")
 
-        ascii_image = Image.open(temp_out).convert("RGBA")
-        os.remove(temp_out)
-        return ascii_image
+            frame_pairs = [
+                (
+                    os.path.join(temp_dir, frame_name),
+                    os.path.join(temp_dir, f"ascii_{index:08d}.png")
+                )
+                for index, frame_name in enumerate(source_frames, start=1)
+            ]
+            process_frames_parallel(frame_pairs)
+
+            run_command([
+                "ffmpeg",
+                "-y",
+                "-framerate", f"{fps:.6f}",
+                "-i", ascii_pattern,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                temp_video,
+            ])
+
+            if has_audio_stream(input_video):
+                run_command([
+                    "ffmpeg",
+                    "-y",
+                    "-i", temp_video,
+                    "-i", input_video,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "copy",
+                    "-c:a", "copy",
+                    "-shortest",
+                    output_video,
+                ])
+            else:
+                shutil.copyfile(temp_video, output_video)
 
     try:
+        if input_img.lower().endswith(".mp4"):
+            process_mp4_video(input_img, output)
+            queue.put(True)
+            return
+
         with Image.open(input_img) as source_image:
             is_animated_gif = (
                 source_image.format == "GIF"
@@ -161,35 +354,38 @@ def generate_ascii_worker(input_img, output, params, queue):
             )
 
             if is_animated_gif:
-                frames = []
-                durations = []
-                loop = source_image.info.get("loop", 0)
+                with tempfile.TemporaryDirectory(dir=output_dir) as temp_dir:
+                    loop = source_image.info.get("loop", 0)
+                    durations = []
+                    frame_pairs = []
 
-                for frame in ImageSequence.Iterator(source_image):
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".png", dir=output_dir, delete=False
-                    ) as temp_frame_file:
-                        temp_frame_path = temp_frame_file.name
+                    for index, frame in enumerate(ImageSequence.Iterator(source_image), start=1):
+                        source_frame_path = os.path.join(temp_dir, f"gif_source_{index:08d}.png")
+                        ascii_frame_path = os.path.join(temp_dir, f"gif_ascii_{index:08d}.png")
 
-                    frame.convert("RGBA").save(temp_frame_path, format="PNG")
-                    ascii_frame = render_ascii_image(temp_frame_path)
-                    os.remove(temp_frame_path)
+                        frame.convert("RGBA").save(source_frame_path, format="PNG")
+                        durations.append(frame.info.get("duration", 100))
+                        frame_pairs.append((source_frame_path, ascii_frame_path))
 
-                    frames.append(ascii_frame.convert("P", palette=Image.ADAPTIVE))
-                    durations.append(frame.info.get("duration", 100))
+                    if not frame_pairs:
+                        raise ValueError("Das GIF enthält keine Frames.")
 
-                if not frames:
-                    raise ValueError("Das GIF enthält keine Frames.")
+                    process_frames_parallel(frame_pairs)
 
-                frames[0].save(
-                    output,
-                    save_all=True,
-                    append_images=frames[1:],
-                    duration=durations,
-                    loop=loop,
-                    optimize=False,
-                    disposal=2,
-                )
+                    frames = []
+                    for _, ascii_path in frame_pairs:
+                        with Image.open(ascii_path) as ascii_frame:
+                            frames.append(ascii_frame.convert("P", palette=Image.ADAPTIVE))
+
+                    frames[0].save(
+                        output,
+                        save_all=True,
+                        append_images=frames[1:],
+                        duration=durations,
+                        loop=loop,
+                        optimize=False,
+                        disposal=2,
+                    )
             else:
                 img = render_ascii_image(input_img)
                 save_params = {
@@ -202,10 +398,9 @@ def generate_ascii_worker(input_img, output, params, queue):
 
                 img.save(output, **save_params)
     except Exception as e:
-        queue.put(e)  # Fehler in die Queue schreiben
+        queue.put(e)
         return
 
-    # Erfolg in die Queue schreiben
     queue.put(True)
 
 class App(TkinterDnD.Tk):
@@ -226,6 +421,7 @@ class App(TkinterDnD.Tk):
         self.color_mode = ctk.StringVar(value="Full Color")
 
         self.jpg_quality = ctk.IntVar(value=95)
+        self.frame_cores = ctk.IntVar(value=max(1, multiprocessing.cpu_count() // 2))
         self.advanced = ctk.BooleanVar(value=False)
 
         self.spinner_running = False
@@ -256,7 +452,7 @@ class App(TkinterDnD.Tk):
         # --- Drag & Drop ---
         self.drop_label = ctk.CTkLabel(
             main,
-            text="📂 Bild hier hineinziehen\n\n",
+            text="📂 Bild/GIF/MP4 hier hineinziehen\n\n",
             height=140,
             corner_radius=14,
             fg_color=("gray25", "gray15"),
@@ -384,7 +580,20 @@ class App(TkinterDnD.Tk):
             textvariable=self.jpg_quality,
             width=100,
             height=36
-        ).grid(row=1, column=0, padx=(0, 8))
+        ).grid(row=1, column=0, padx=(0, 8), pady=(0, 8))
+
+        ctk.CTkLabel(
+            self.adv_frame,
+            text="GIF/Video Kerne",
+            font=("Segoe UI", 13)
+        ).grid(row=2, column=0, sticky="w", padx=(0, 8))
+
+        ctk.CTkEntry(
+            self.adv_frame,
+            textvariable=self.frame_cores,
+            width=100,
+            height=36
+        ).grid(row=3, column=0, padx=(0, 8))
 
         # standardmäßig versteckt
         self.adv_frame.grid_forget()
@@ -423,7 +632,7 @@ class App(TkinterDnD.Tk):
             messagebox.showerror("Fehler", "Ungültige Datei.")
             return
         self.input_image.set(path)
-        self.drop_label.configure(text=f"📂 Bild hier hineinziehen\n\n{path}")
+        self.drop_label.configure(text=f"📂 Bild/GIF/MP4 hier hineinziehen\n\n{path}")
 
     def select_output(self):
         path = filedialog.asksaveasfilename(
@@ -433,7 +642,8 @@ class App(TkinterDnD.Tk):
                 ("PNG", "*.png"),
                 ("GIF", "*.gif"),
                 ("TIFF", "*.tiff"),
-                ("BMP", "*.bmp")
+                ("BMP", "*.bmp"),
+                ("MP4 Video", "*.mp4")
             ]
         )
         if path:
@@ -457,12 +667,15 @@ class App(TkinterDnD.Tk):
             return
 
         try:
-            with Image.open(input_img) as source_image:
-                is_animated_gif = (
-                    source_image.format == "GIF"
-                    and getattr(source_image, "is_animated", False)
-                    and source_image.n_frames > 1
-                )
+            if input_img.lower().endswith(".mp4"):
+                is_animated_gif = False
+            else:
+                with Image.open(input_img) as source_image:
+                    is_animated_gif = (
+                        source_image.format == "GIF"
+                        and getattr(source_image, "is_animated", False)
+                        and source_image.n_frames > 1
+                    )
         except Exception:
             is_animated_gif = False
 
@@ -473,13 +686,21 @@ class App(TkinterDnD.Tk):
             )
             return
 
+        if input_img.lower().endswith(".mp4") and not output.lower().endswith(".mp4"):
+            messagebox.showwarning(
+                "Fehler",
+                "MP4-Dateien können nur als .mp4 ausgegeben werden."
+            )
+            return
+
         try:
             params = {
                 "rotate": int(self.rotation.get()),
                 "columns": int(self.columns.get()),
                 "brightness": float(str(self.brightness.get()).replace(",", ".")),
                 "quality": int(self.jpg_quality.get()),
-                "color_mode": self.color_mode.get()
+                "color_mode": self.color_mode.get(),
+                "frame_cores": max(1, min(int(self.frame_cores.get()), multiprocessing.cpu_count()))
             }
         except ValueError:
             messagebox.showerror("Fehler", "Ungültige Eingabewerte.")
@@ -504,16 +725,25 @@ class App(TkinterDnD.Tk):
         self.after(0, self.check_process_status)
 
     def check_process_status(self):
-        # 1️⃣ ZUERST versuchen, ein Ergebnis aus der Queue zu holen
-        try:
-            result = self.result_queue.get_nowait()
-        except Exception:
-            result = None
+        # 1️⃣ Alle verfügbaren Queue-Nachrichten verarbeiten
+        while True:
+            try:
+                result = self.result_queue.get_nowait()
+            except Empty:
+                break
 
-        if result is not None:
+            if isinstance(result, tuple) and len(result) == 3 and result[0] == "progress":
+                current = result[1]
+                total = result[2]
+                self.generate_btn.configure(text=f"In Arbeit... {current}/{total}")
+                continue
+
             if isinstance(result, Exception):
                 messagebox.showerror("Fehler", str(result))
-            # Erfolg ODER Fehler → Generation beenden
+                self.finish_generation()
+                return
+
+            # Erfolg ODER unbekannte End-Nachricht → Generation beenden
             self.finish_generation()
             return
 
