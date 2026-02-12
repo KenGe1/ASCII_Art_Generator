@@ -6,6 +6,8 @@ import multiprocessing
 from multiprocessing import Process, Queue, freeze_support
 import itertools
 import ctypes
+import shutil
+import subprocess
 from ascii_magic import AsciiArt
 from PIL import Image, ImageEnhance, ImageSequence
 import sys
@@ -123,6 +125,56 @@ def generate_ascii_worker(input_img, output, params, queue):
 
     output_dir = os.path.dirname(output) or "."
 
+    def run_command(command):
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                "FFmpeg wurde nicht gefunden. Bitte FFmpeg installieren und zum PATH hinzufügen."
+            ) from e
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            raise RuntimeError(stderr or "FFmpeg-Befehl fehlgeschlagen.") from e
+
+    def get_video_fps(video_path):
+        output_text = run_command([
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            video_path,
+        ]).strip()
+
+        if not output_text or output_text == "0/0":
+            return 30.0
+
+        if "/" in output_text:
+            num, den = output_text.split("/", 1)
+            den_value = float(den)
+            if den_value == 0:
+                return 30.0
+            return float(num) / den_value
+
+        return float(output_text)
+
+    def has_audio_stream(video_path):
+        output_text = run_command([
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            video_path,
+        ]).strip()
+        return bool(output_text)
+
     def render_ascii_image(source_path):
         with tempfile.NamedTemporaryFile(
             suffix=".png", dir=output_dir, delete=False
@@ -152,7 +204,69 @@ def generate_ascii_worker(input_img, output, params, queue):
         os.remove(temp_out)
         return ascii_image
 
+    def process_mp4_video(input_video, output_video):
+        fps = get_video_fps(input_video)
+
+        with tempfile.TemporaryDirectory(dir=output_dir) as temp_dir:
+            source_pattern = os.path.join(temp_dir, "source_%08d.png")
+            ascii_pattern = os.path.join(temp_dir, "ascii_%08d.png")
+            temp_video = os.path.join(temp_dir, "video_no_audio.mp4")
+
+            run_command([
+                "ffmpeg",
+                "-y",
+                "-i", input_video,
+                "-vsync", "0",
+                source_pattern,
+            ])
+
+            source_frames = sorted(
+                file_name
+                for file_name in os.listdir(temp_dir)
+                if file_name.startswith("source_") and file_name.endswith(".png")
+            )
+
+            if not source_frames:
+                raise RuntimeError("Das MP4 enthält keine verarbeitbaren Frames.")
+
+            for index, frame_name in enumerate(source_frames, start=1):
+                source_path = os.path.join(temp_dir, frame_name)
+                ascii_path = os.path.join(temp_dir, f"ascii_{index:08d}.png")
+                ascii_img = render_ascii_image(source_path)
+                ascii_img.save(ascii_path, optimize=True)
+
+            run_command([
+                "ffmpeg",
+                "-y",
+                "-framerate", f"{fps:.6f}",
+                "-i", ascii_pattern,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                temp_video,
+            ])
+
+            if has_audio_stream(input_video):
+                run_command([
+                    "ffmpeg",
+                    "-y",
+                    "-i", temp_video,
+                    "-i", input_video,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "copy",
+                    "-c:a", "copy",
+                    "-shortest",
+                    output_video,
+                ])
+            else:
+                shutil.copyfile(temp_video, output_video)
+
     try:
+        if input_img.lower().endswith(".mp4"):
+            process_mp4_video(input_img, output)
+            queue.put(True)
+            return
+
         with Image.open(input_img) as source_image:
             is_animated_gif = (
                 source_image.format == "GIF"
@@ -256,7 +370,7 @@ class App(TkinterDnD.Tk):
         # --- Drag & Drop ---
         self.drop_label = ctk.CTkLabel(
             main,
-            text="📂 Bild hier hineinziehen\n\n",
+            text="📂 Bild/GIF/MP4 hier hineinziehen\n\n",
             height=140,
             corner_radius=14,
             fg_color=("gray25", "gray15"),
@@ -423,7 +537,7 @@ class App(TkinterDnD.Tk):
             messagebox.showerror("Fehler", "Ungültige Datei.")
             return
         self.input_image.set(path)
-        self.drop_label.configure(text=f"📂 Bild hier hineinziehen\n\n{path}")
+        self.drop_label.configure(text=f"📂 Bild/GIF/MP4 hier hineinziehen\n\n{path}")
 
     def select_output(self):
         path = filedialog.asksaveasfilename(
@@ -433,7 +547,8 @@ class App(TkinterDnD.Tk):
                 ("PNG", "*.png"),
                 ("GIF", "*.gif"),
                 ("TIFF", "*.tiff"),
-                ("BMP", "*.bmp")
+                ("BMP", "*.bmp"),
+                ("MP4 Video", "*.mp4")
             ]
         )
         if path:
@@ -457,12 +572,15 @@ class App(TkinterDnD.Tk):
             return
 
         try:
-            with Image.open(input_img) as source_image:
-                is_animated_gif = (
-                    source_image.format == "GIF"
-                    and getattr(source_image, "is_animated", False)
-                    and source_image.n_frames > 1
-                )
+            if input_img.lower().endswith(".mp4"):
+                is_animated_gif = False
+            else:
+                with Image.open(input_img) as source_image:
+                    is_animated_gif = (
+                        source_image.format == "GIF"
+                        and getattr(source_image, "is_animated", False)
+                        and source_image.n_frames > 1
+                    )
         except Exception:
             is_animated_gif = False
 
@@ -470,6 +588,13 @@ class App(TkinterDnD.Tk):
             messagebox.showwarning(
                 "Fehler",
                 "Animierte GIFs können nur als .gif ausgegeben werden."
+            )
+            return
+
+        if input_img.lower().endswith(".mp4") and not output.lower().endswith(".mp4"):
+            messagebox.showwarning(
+                "Fehler",
+                "MP4-Dateien können nur als .mp4 ausgegeben werden."
             )
             return
 
