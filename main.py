@@ -166,6 +166,40 @@ def split_into_batches(items, batch_count):
     ]
 
 
+
+
+def extract_video_segment_frames(payload):
+    input_video, start_time, duration, segment_dir = payload
+    output_pattern = os.path.join(segment_dir, "frame_%08d.png")
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-v", "error",
+        "-ss", f"{start_time:.6f}",
+        "-t", f"{duration:.6f}",
+        "-i", input_video,
+        "-vsync", "0",
+        output_pattern,
+    ]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "FFmpeg wurde nicht gefunden. Bitte FFmpeg installieren und zum PATH hinzufügen."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        raise RuntimeError(stderr or "FFmpeg-Befehl fehlgeschlagen.") from e
+
+    return sum(
+        1
+        for file_name in os.listdir(segment_dir)
+        if file_name.startswith("frame_") and file_name.endswith(".png")
+    )
+
+
 def generate_ascii_worker(input_img, output, params, queue):
     rotate = params["rotate"]
     columns = params["columns"]
@@ -233,6 +267,20 @@ def generate_ascii_worker(input_img, output, params, queue):
 
         return float(output_text)
 
+    def get_video_duration(video_path):
+        output_text = run_command([
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            video_path,
+        ]).strip()
+
+        if not output_text or output_text == "N/A":
+            return 0.0
+
+        return max(0.0, float(output_text))
+
     def has_audio_stream(video_path):
         output_text = run_command([
             "ffprobe",
@@ -282,19 +330,67 @@ def generate_ascii_worker(input_img, output, params, queue):
 
     def process_mp4_video(input_video, output_video):
         fps = get_video_fps(input_video)
+        duration = get_video_duration(input_video)
 
         with tempfile.TemporaryDirectory(dir=output_dir) as temp_dir:
             source_pattern = os.path.join(temp_dir, "source_%08d.png")
             ascii_pattern = os.path.join(temp_dir, "ascii_%08d.png")
             temp_video = os.path.join(temp_dir, "video_no_audio.mp4")
 
-            run_command([
-                "ffmpeg",
-                "-y",
-                "-i", input_video,
-                "-vsync", "0",
-                source_pattern,
-            ])
+            extraction_workers = max(1, min(frame_cores, multiprocessing.cpu_count()))
+            use_parallel_extraction = extraction_workers > 1 and duration > 0
+
+            if use_parallel_extraction:
+                segment_root = os.path.join(temp_dir, "segments")
+                os.makedirs(segment_root, exist_ok=True)
+
+                segment_duration = duration / extraction_workers
+                extraction_jobs = []
+
+                for segment_index in range(extraction_workers):
+                    start_time = segment_index * segment_duration
+                    current_duration = (
+                        duration - start_time
+                        if segment_index == extraction_workers - 1
+                        else segment_duration
+                    )
+                    if current_duration <= 0:
+                        continue
+
+                    segment_dir = os.path.join(segment_root, f"segment_{segment_index:03d}")
+                    os.makedirs(segment_dir, exist_ok=True)
+                    extraction_jobs.append(
+                        (input_video, start_time, current_duration, segment_dir)
+                    )
+
+                if extraction_jobs:
+                    ctx = multiprocessing.get_context("spawn")
+                    with ctx.Pool(processes=min(extraction_workers, len(extraction_jobs))) as pool:
+                        list(pool.imap_unordered(extract_video_segment_frames, extraction_jobs))
+
+                source_frame_index = 1
+                for _, _, _, segment_dir in extraction_jobs:
+                    segment_frames = sorted(
+                        file_name
+                        for file_name in os.listdir(segment_dir)
+                        if file_name.startswith("frame_") and file_name.endswith(".png")
+                    )
+                    for segment_frame in segment_frames:
+                        source_path = os.path.join(segment_dir, segment_frame)
+                        merged_path = os.path.join(
+                            temp_dir,
+                            f"source_{source_frame_index:08d}.png"
+                        )
+                        shutil.move(source_path, merged_path)
+                        source_frame_index += 1
+            else:
+                run_command([
+                    "ffmpeg",
+                    "-y",
+                    "-i", input_video,
+                    "-vsync", "0",
+                    source_pattern,
+                ])
 
             source_frames = sorted(
                 file_name
