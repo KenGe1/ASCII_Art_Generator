@@ -5,7 +5,6 @@ import os
 import multiprocessing
 from multiprocessing import Process, Queue, freeze_support
 from queue import Empty
-from math import ceil
 import itertools
 import ctypes
 import shutil
@@ -142,28 +141,10 @@ def render_ascii_file(source_path, output_path, render_params):
     os.remove(temp_out)
 
 
-def process_frame_batch(batch, render_params):
-    processed = 0
-    for source_path, output_path in batch:
-        render_ascii_file(source_path, output_path, render_params)
-        processed += 1
-    return processed
-
-
-def process_frame_batch_payload(payload):
-    batch, render_params = payload
-    return process_frame_batch(batch, render_params)
-
-
-def split_into_batches(items, batch_count):
-    if not items:
-        return []
-
-    chunk_size = ceil(len(items) / batch_count)
-    return [
-        items[index:index + chunk_size]
-        for index in range(0, len(items), chunk_size)
-    ]
+def process_single_frame_payload(payload):
+    source_path, output_path, render_params = payload
+    render_ascii_file(source_path, output_path, render_params)
+    return 1
 
 
 
@@ -311,21 +292,23 @@ def generate_ascii_worker(input_img, output, params, queue):
             return
 
         workers = max(1, min(frame_cores, total_frames))
+        processed_frames = 0
 
         if workers == 1:
-            for index, (source_path, target_path) in enumerate(frame_pairs, start=1):
+            for source_path, target_path in frame_pairs:
                 render_ascii_file(source_path, target_path, render_params)
-                queue.put(("progress", index, total_frames))
+                processed_frames += 1
+                queue.put(("progress", processed_frames, total_frames))
             return
-
-        batches = split_into_batches(frame_pairs, workers)
-        processed_frames = 0
 
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=workers) as pool:
-            payloads = [(batch, render_params) for batch in batches]
-            for processed_batch in pool.imap_unordered(process_frame_batch_payload, payloads):
-                processed_frames += processed_batch
+            payloads = [
+                (source_path, target_path, render_params)
+                for source_path, target_path in frame_pairs
+            ]
+            for processed_one in pool.imap_unordered(process_single_frame_payload, payloads):
+                processed_frames += processed_one
                 queue.put(("progress", processed_frames, total_frames))
 
     def process_mp4_video(input_video, output_video):
